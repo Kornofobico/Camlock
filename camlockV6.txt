@@ -28,7 +28,9 @@ local aimlockEnabled = false
 local autoFireEnabled = false
 local currentTarget -- BasePart (da parte alvo)
 local maxDistance = 500
-local lerpSpeed = 0.15
+-- Agora usamos porcentagem (0-100) para mostrar ao usuário, e normalizamos para 0.0-1.0 internamente
+local lerpSpeedNormalized = 0.15 -- valor usado no Lerp (0.0 - 1.0)
+local lerpPercent = lerpSpeedNormalized * 100 -- valor exibido/editar (0 - 100)
 local fov = 100 -- FOV adicionado (interpreto como raio em pixels)
 
 local selectedPart = "Head"
@@ -76,7 +78,8 @@ local function saveConfig()
         aimlockEnabled = aimlockEnabled,
         autoFireEnabled = autoFireEnabled,
         maxDistance = maxDistance,
-        lerpSpeed = lerpSpeed,
+        -- salvamos a porcentagem (0-100) para fins de edição legível
+        lerpSpeed = lerpPercent,
         fov = fov,
         selectedPart = selectedPart,
         whitelistedTeams = whitelistedTeams,
@@ -110,12 +113,23 @@ local function loadConfig()
     aimlockEnabled = (data.aimlockEnabled == true) or aimlockEnabled
     autoFireEnabled = (data.autoFireEnabled == true) or autoFireEnabled
     maxDistance = (type(data.maxDistance) == "number") and data.maxDistance or maxDistance
-    lerpSpeed = (type(data.lerpSpeed) == "number") and data.lerpSpeed or lerpSpeed
     fov = (type(data.fov) == "number") and data.fov or fov
     selectedPart = (type(data.selectedPart) == "string") and data.selectedPart or selectedPart
     if type(data.whitelistedTeams) == "table" then
         whitelistedTeams = data.whitelistedTeams
     end
+
+    -- Compatibilidade: se o valor salvo for <= 1, tratamos como valor normalizado antigo; se for >1 tratamos como porcentagem (0-100)
+    if type(data.lerpSpeed) == "number" then
+        if data.lerpSpeed <= 1 then
+            lerpSpeedNormalized = math.clamp(data.lerpSpeed, 0, 1)
+            lerpPercent = lerpSpeedNormalized * 100
+        else
+            lerpPercent = math.clamp(data.lerpSpeed, 0, 100)
+            lerpSpeedNormalized = lerpPercent / 100
+        end
+    end
+
     -- floatingPosition será lido posteriormente na criação do botão
     return data.floatingPosition
 end
@@ -496,17 +510,24 @@ local function createGui()
         end
     end)
 
-    local smoothBox = makeInput(content, "Suavidade (0.01 - 1.0)", tostring(lerpSpeed))
+    -- >>> ALTERAÇÃO: Suavidade agora em escala 0-100 (porcentagem)
+    local smoothBox = makeInput(content, "Suavidade (0 - 100)", string.format("%.2f", lerpPercent))
     smoothBox.FocusLost:Connect(function()
-        local num = tonumber(smoothBox.Text)
-        if num and num > 0 and num <= 1 then
-            lerpSpeed = num
-            smoothBox.Text = tostring(num)
+        local text = smoothBox.Text:gsub(",", ".")
+        local num = tonumber(text)
+        -- Validar intervalo 0 a 100
+        if num and num >= 0 and num <= 100 then
+            lerpPercent = num
+            lerpSpeedNormalized = math.clamp(lerpPercent / 100, 0, 1)
+            -- Mostrar com 2 casas decimais para consistência (ex.: 90.00)
+            smoothBox.Text = string.format("%.2f", lerpPercent)
             pcall(saveConfig)
         else
-            smoothBox.Text = tostring(lerpSpeed)
+            -- Reverter para valor atual formatado com 2 casas
+            smoothBox.Text = string.format("%.2f", lerpPercent)
         end
     end)
+    -- <<< fim alteração
 
     -- Seção: FOV
     makeSection(content, "FOV")
@@ -678,7 +699,8 @@ local rsConn = RunService.RenderStepped:Connect(function(dt)
             local pos = Camera.CFrame.Position
             local targetPos = currentTarget.Position
             local desired = CFrame.new(pos, targetPos)
-            Camera.CFrame = Camera.CFrame:Lerp(desired, lerpSpeed)
+            -- usar o valor normalizado (0.0 - 1.0)
+            Camera.CFrame = Camera.CFrame:Lerp(desired, lerpSpeedNormalized)
             
             -- Executar Auto Fire se estiver habilitado
             performAutoFire()
