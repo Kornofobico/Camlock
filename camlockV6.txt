@@ -50,6 +50,9 @@ local autoFireDelay = 0.1 -- Delay entre disparos (segundos)
 local toggleAimButton -- botão dentro do painel
 local floatingToggleButton -- botão flutuante externo
 
+-- Offset de mira: adiciona ajuste de posição X/Y/Z ao alvo (em studs)
+local aimOffset = Vector3.new(0, 0, 0)
+
 -- Config file
 local configPath = "CamlockConfig.json"
 
@@ -85,7 +88,8 @@ local function saveConfig()
             XOff = floatingToggleButton.Position.X.Offset,
             Y = floatingToggleButton.Position.Y.Scale,
             YOff = floatingToggleButton.Position.Y.Offset
-        }) or nil
+        }) or nil,
+        aimOffset = { x = aimOffset.X, y = aimOffset.Y, z = aimOffset.Z }
     }
     local ok, err = pcall(function()
         writefile(configPath, HttpService:JSONEncode(cfg))
@@ -116,14 +120,20 @@ local function loadConfig()
     if type(data.whitelistedTeams) == "table" then
         whitelistedTeams = data.whitelistedTeams
     end
-    -- floatingPosition será lido posteriormente na criação do botão
+
+    if type(data.aimOffset) == "table" then
+        local ax = tonumber(data.aimOffset.x) or 0
+        local ay = tonumber(data.aimOffset.y) or 0
+        local az = tonumber(data.aimOffset.z) or 0
+        aimOffset = Vector3.new(ax, ay, az)
+    end
+
     return data.floatingPosition
 end
 
 --// FOV Circle (GUI-based visual, substitui Drawing)
 local fovGuiFrame
 local function createOrUpdateFOVGui()
-    -- garante que a GUI raiz exista antes de criar o círculo
     if not screenGui or not screenGui.Parent then return end
 
     local radius = math.clamp(tonumber(fov) or 100, 1, 2000)
@@ -133,18 +143,16 @@ local function createOrUpdateFOVGui()
         fovGuiFrame = Instance.new("Frame")
         fovGuiFrame.Name = "FOVCircle"
         fovGuiFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-        fovGuiFrame.BackgroundTransparency = 1 -- sem preenchimento visível
+        fovGuiFrame.BackgroundTransparency = 1
         fovGuiFrame.Size = UDim2.new(0, size, 0, size)
         fovGuiFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
         fovGuiFrame.ZIndex = 9998
         fovGuiFrame.Parent = screenGui
 
-        -- UICorner para transformar o frame em círculo (quando é quadrado)
         local corner = Instance.new("UICorner")
         corner.CornerRadius = UDim.new(1, 0)
         corner.Parent = fovGuiFrame
 
-        -- UIStroke para desenhar a borda do círculo
         local stroke = Instance.new("UIStroke")
         stroke.Name = "FOVStroke"
         stroke.Color = Color3.fromRGB(0, 255, 0)
@@ -165,14 +173,12 @@ local function createOrUpdateFOVGui()
     fovGuiFrame.Visible = aimlockEnabled
 end
 
--- Atualiza círculo todo frame (mantém centralizado e com o raio atual)
 RunService.RenderStepped:Connect(function()
     if fovGuiFrame and fovGuiFrame.Parent then
         local radius = math.clamp(tonumber(fov) or 100, 1, 2000)
         local size = radius * 2
         fovGuiFrame.Size = UDim2.new(0, size, 0, size)
         fovGuiFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
-        -- visibilidade ligada ao estado do aimlock
         fovGuiFrame.Visible = aimlockEnabled
     end
 end)
@@ -180,17 +186,18 @@ end)
 --// Util
 local function onScreenAndVisible(part: BasePart)
     if not part then return false end
-    -- On-screen
-    local _, onScreen = Camera:WorldToViewportPoint(part.Position)
+    local targetPos = part.Position + aimOffset
+
+    local _, onScreen = Camera:WorldToViewportPoint(targetPos)
     if not onScreen then return false end
-    -- Wallcheck
+
     local origin = Camera.CFrame.Position
-    local direction = (part.Position - origin)
+    local direction = (targetPos - origin)
     local rayParams = RaycastParams.new()
     rayParams.FilterDescendantsInstances = {LocalPlayer.Character}
     rayParams.FilterType = Enum.RaycastFilterType.Blacklist
     local result = workspace:Raycast(origin, direction, rayParams)
-    return not result or result.Instance:IsDescendantOf(part.Parent)
+    return not result or (result.Instance and result.Instance:IsDescendantOf(part.Parent))
 end
 
 local function isTargetValid(targetPart: BasePart)
@@ -198,7 +205,8 @@ local function isTargetValid(targetPart: BasePart)
     local char = targetPart.Parent
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return false end
-    if (targetPart.Position - Camera.CFrame.Position).Magnitude > maxDistance then return false end
+    local targetPos = targetPart.Position + aimOffset
+    if (targetPos - Camera.CFrame.Position).Magnitude > maxDistance then return false end
     if not onScreenAndVisible(targetPart) then return false end
     return true
 end
@@ -208,13 +216,14 @@ local function getTeamName(player: Player)
 end
 
 local function isInFOV(targetPart: BasePart)
-    local screenPoint, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+    local targetPos = targetPart.Position + aimOffset
+    local screenPoint, onScreen = Camera:WorldToViewportPoint(targetPos)
     if not onScreen then return false end
-    
+
     local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
     local point = Vector2.new(screenPoint.X, screenPoint.Y)
     local distance = (point - center).Magnitude
-    
+
     return distance <= fov
 end
 
@@ -228,7 +237,7 @@ local function getNearestEnemyPart()
                 local hum = p.Character:FindFirstChildOfClass("Humanoid")
                 local part = p.Character:FindFirstChild(selectedPart)
                 if hum and hum.Health > 0 and part and part:IsA("BasePart") then
-                    local dist = (part.Position - Camera.CFrame.Position).Magnitude
+                    local dist = (part.Position + aimOffset - Camera.CFrame.Position).Magnitude
                     if dist < maxDistance and onScreenAndVisible(part) and dist < shortest and isInFOV(part) then
                         shortest = dist
                         closest = part
@@ -244,15 +253,14 @@ end
 local function performAutoFire()
     if not autoFireEnabled then return end
     if not currentTarget or not isTargetValid(currentTarget) then return end
-    
+
     local currentTime = tick()
     if currentTime - lastAutoFireTime >= autoFireDelay then
         lastAutoFireTime = currentTime
-        
-        -- Simular pressionar e soltar o botão de atirar
+
         pcall(function()
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.ButtonR2, false, nil)
-            task.wait(0.05) -- Pequeno delay para garantir o disparo
+            task.wait(0.05)
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.ButtonR2, false, nil)
         end)
     end
@@ -334,28 +342,23 @@ local function setAimlockState(enabled)
     aimlockEnabled = enabled
     currentTarget = nil
 
-    -- Atualiza botão dentro do painel
     if toggleAimButton and toggleAimButton.Parent then
         toggleAimButton.Text = "Aimlock: " .. (aimlockEnabled and "ON" or "OFF")
         toggleAimButton.BackgroundColor3 = aimlockEnabled and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(60, 60, 60)
     end
 
-    -- Atualiza botão flutuante
     if floatingToggleButton and floatingToggleButton.Parent then
         floatingToggleButton.Text = "Aimlock: " .. (aimlockEnabled and "ON" or "OFF")
         floatingToggleButton.BackgroundColor3 = aimlockEnabled and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(50, 50, 50)
     end
 
-    -- Atualiza visibilidade do FOV GUI
     if fovGuiFrame and fovGuiFrame.Parent then
         fovGuiFrame.Visible = aimlockEnabled
     end
 
-    -- Persistir alteração
     pcall(saveConfig)
 end
 
--- Carregar configuração salva (se possível) antes de criar a GUI para usar valores carregados
 local loadedFloatingPos = loadConfig()
 
 --// GUI Principal
@@ -368,7 +371,6 @@ local function createGui()
     screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 
-    -- Label de status no topo central
     enemyLabel = Instance.new("TextLabel")
     enemyLabel.Size = UDim2.new(0, 220, 0, 30)
     enemyLabel.Position = UDim2.new(0.5, -110, 0.05, 0)
@@ -379,7 +381,6 @@ local function createGui()
     enemyLabel.Font = Enum.Font.GothamBold
     enemyLabel.Parent = screenGui
 
-    -- Botão flutuante para abrir painel
     openPanelButton = Instance.new("TextButton")
     openPanelButton.Size = UDim2.new(0, 120, 0, 32)
     openPanelButton.Position = UDim2.new(0.02, 0, 0.9, 0)
@@ -391,9 +392,8 @@ local function createGui()
     openPanelButton.Parent = screenGui
     Instance.new("UICorner", openPanelButton).CornerRadius = UDim.new(0, 6)
 
-    -- Painel principal
     mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 290, 0, 500) -- Aumentado para acomodar Auto Fire
+    mainFrame.Size = UDim2.new(0, 290, 0, 500)
     mainFrame.Position = UDim2.new(0.06, 0, 0.2, 0)
     mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
     mainFrame.BorderSizePixel = 0
@@ -404,7 +404,6 @@ local function createGui()
     mainStroke.Color = Color3.fromRGB(70,70,70)
     mainStroke.Thickness = 1
 
-    -- Top Bar
     local topBar = Instance.new("Frame")
     topBar.Size = UDim2.new(1, 0, 0, 36)
     topBar.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
@@ -441,7 +440,6 @@ local function createGui()
     openPanelButton.MouseButton1Click:Connect(togglePanel)
     minimizeButton.MouseButton1Click:Connect(togglePanel)
 
-    -- Conteúdo (scroller vertical com seções)
     local content = Instance.new("ScrollingFrame")
     content.Size = UDim2.new(1, -16, 1, -52)
     content.Position = UDim2.new(0, 8, 0, 44)
@@ -461,15 +459,13 @@ local function createGui()
     list.Padding = UDim.new(0, 10)
     list.SortOrder = Enum.SortOrder.LayoutOrder
 
-    -- Seção: Controle
     makeSection(content, "CONTROLE")
     local toggleAim = makeButton(content, "Aimlock: OFF")
-    toggleAimButton = toggleAim -- guarda referência para sincronizar
+    toggleAimButton = toggleAim
     toggleAim.MouseButton1Click:Connect(function()
         setAimlockState(not aimlockEnabled)
     end)
 
-    -- Seção: Auto Fire
     makeSection(content, "AUTO FIRE")
     local toggleAutoFire = makeButton(content, "Auto Fire: OFF")
     toggleAutoFire.MouseButton1Click:Connect(function()
@@ -478,11 +474,9 @@ local function createGui()
         toggleAutoFire.BackgroundColor3 = autoFireEnabled and Color3.fromRGB(170, 0, 0) or Color3.fromRGB(60, 60, 60)
         pcall(saveConfig)
     end)
-    -- Aplicar estado inicial de AutoFire com base no carregado
     toggleAutoFire.Text = "Auto Fire: " .. (autoFireEnabled and "ON" or "OFF")
     toggleAutoFire.BackgroundColor3 = autoFireEnabled and Color3.fromRGB(170, 0, 0) or Color3.fromRGB(60, 60, 60)
 
-    -- Seção: Parâmetros
     makeSection(content, "PARÂMETROS")
     local distanceBox = makeInput(content, "Distância (studs)", tostring(maxDistance))
     distanceBox.FocusLost:Connect(function()
@@ -508,7 +502,6 @@ local function createGui()
         end
     end)
 
-    -- Seção: FOV
     makeSection(content, "FOV")
     local fovBox = makeInput(content, "FOV (1-500)", tostring(fov))
     fovBox.FocusLost:Connect(function()
@@ -526,7 +519,6 @@ local function createGui()
         end
     end)
 
-    -- Seção: Parte Alvo
     makeSection(content, "PARTE ALVO")
     local partList = Instance.new("ScrollingFrame")
     partList.Size = UDim2.new(1, 0, 0, 120)
@@ -559,14 +551,13 @@ local function createGui()
                     end
                 end
                 b.Text = "[✓] " .. name
-                currentTarget = nil -- força revalidação com a nova parte
+                currentTarget = nil
                 pcall(saveConfig)
             end)
         end
     end
     refreshPartButtons()
 
-    -- Seção: Whitelist de Times
     makeSection(content, "WHITELIST DE TIMES")
     local teamList = Instance.new("ScrollingFrame")
     teamList.Size = UDim2.new(1, 0, 0, 150)
@@ -593,21 +584,57 @@ local function createGui()
                 local nowOn = whitelistedTeams[t.Name] == true
                 b.Text = (nowOn and "[✓] " or "[ ] ") .. t.Name
                 pcall(saveConfig)
-                -- atualizar ESP para refletir exclusão de aliados
             end)
         end
     end
     addTeamButtons()
-
-    -- Segurança: se times mudarem após o join, recarregar a lista
     Teams.ChildAdded:Connect(function() addTeamButtons() end)
     Teams.ChildRemoved:Connect(function() addTeamButtons() end)
 
-    --// BOTÃO ON/OFF FLUTUANTE PARA AIMLOCK (criado aqui para sincronização e para ser recriado junto com a GUI)
+    makeSection(content, "OFFSET")
+    local offsetContainer = Instance.new("Frame")
+    offsetContainer.Size = UDim2.new(1, 0, 0, 110)
+    offsetContainer.BackgroundTransparency = 1
+    offsetContainer.Parent = content
+
+    local offsetXBox = makeInput(offsetContainer, "Offset X (studs)", tostring(aimOffset.X))
+    local offsetYBox = makeInput(offsetContainer, "Offset Y (studs)", tostring(aimOffset.Y))
+    local offsetZBox = makeInput(offsetContainer, "Offset Z (studs)", tostring(aimOffset.Z))
+
+    offsetXBox.FocusLost:Connect(function()
+        local nx = tonumber(offsetXBox.Text)
+        if nx then
+            aimOffset = Vector3.new(nx, aimOffset.Y, aimOffset.Z)
+            offsetXBox.Text = tostring(nx)
+            pcall(saveConfig)
+        else
+            offsetXBox.Text = tostring(aimOffset.X)
+        end
+    end)
+    offsetYBox.FocusLost:Connect(function()
+        local ny = tonumber(offsetYBox.Text)
+        if ny then
+            aimOffset = Vector3.new(aimOffset.X, ny, aimOffset.Z)
+            offsetYBox.Text = tostring(ny)
+            pcall(saveConfig)
+        else
+            offsetYBox.Text = tostring(aimOffset.Y)
+        end
+    end)
+    offsetZBox.FocusLost:Connect(function()
+        local nz = tonumber(offsetZBox.Text)
+        if nz then
+            aimOffset = Vector3.new(aimOffset.X, aimOffset.Y, nz)
+            offsetZBox.Text = tostring(nz)
+            pcall(saveConfig)
+        else
+            offsetZBox.Text = tostring(aimOffset.Z)
+        end
+    end)
+
     local floatingToggle = Instance.new("TextButton")
     floatingToggle.Name = "FloatingAimToggle"
     floatingToggle.Size = UDim2.new(0, 120, 0, 40)
-    -- aplicar posição carregada se existir
     if loadedFloatingPos and type(loadedFloatingPos) == "table" and loadedFloatingPos.X then
         floatingToggle.Position = UDim2.new(loadedFloatingPos.X or 0.8, loadedFloatingPos.XOff or 0, loadedFloatingPos.Y or 0.1, loadedFloatingPos.YOff or 0)
     else
@@ -620,23 +647,19 @@ local function createGui()
     floatingToggle.TextSize = 14
     floatingToggle.Parent = screenGui
     Instance.new("UICorner", floatingToggle).CornerRadius = UDim.new(0, 8)
-    floatingToggleButton = floatingToggle -- guarda referência para sincronizar
+    floatingToggleButton = floatingToggle
 
-    -- Atualiza o botão ao clicar (usa a função central para sincronizar)
     floatingToggle.MouseButton1Click:Connect(function()
         setAimlockState(not aimlockEnabled)
     end)
 
-    -- Função para arrastar o botão flutuante (salva posição quando o arraste termina)
     local function draggable(btn)
         local dragging = false
         local dragStart = nil
         local startPos = nil
 
         btn.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1 or
-               input.UserInputType == Enum.UserInputType.Touch then
-                
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
                 dragging = true
                 dragStart = input.Position
                 startPos = btn.Position
@@ -644,16 +667,14 @@ local function createGui()
                 input.Changed:Connect(function()
                     if input.UserInputState == Enum.UserInputState.End then
                         dragging = false
-                        pcall(saveConfig) -- salva posição ao soltar
+                        pcall(saveConfig)
                     end
                 end)
             end
         end)
 
         btn.InputChanged:Connect(function(input)
-            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or
-                             input.UserInputType == Enum.UserInputType.Touch) then
-
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
                 local delta = input.Position - dragStart
                 btn.Position = UDim2.new(
                     startPos.X.Scale, startPos.X.Offset + delta.X,
@@ -664,7 +685,6 @@ local function createGui()
     end
     draggable(floatingToggle)
 
-    -- Sincroniza o estado inicial dos botões com a variável aimlockEnabled
     setAimlockState(aimlockEnabled)
 end
 
@@ -676,45 +696,36 @@ local rsConn = RunService.RenderStepped:Connect(function(dt)
         end
         if currentTarget then
             local pos = Camera.CFrame.Position
-            local targetPos = currentTarget.Position
+            local targetPos = currentTarget.Position + aimOffset
             local desired = CFrame.new(pos, targetPos)
             Camera.CFrame = Camera.CFrame:Lerp(desired, lerpSpeed)
-            
-            -- Executar Auto Fire se estiver habilitado
             performAutoFire()
         end
 
         if enemyLabel then
             enemyLabel.Text = (currentTarget and isTargetValid(currentTarget)) and "INIMIGO" or ""
         end
-
     else
         if enemyLabel then enemyLabel.Text = "" end
     end
 end)
 
---// Inicialização GUI e FOV
 createGui()
 createOrUpdateFOVGui()
 
--- Atualizar FOV quando a tela mudar de tamanho (recria/atualiza propriedades)
 Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
     createOrUpdateFOVGui()
 end)
 
--- Garantir que a GUI volte após respawn (sem sumir botão)
 LocalPlayer.CharacterAdded:Connect(function()
     task.wait(0.8)
     if not LocalPlayer.PlayerGui:FindFirstChild("AimlockPanel") then
-        -- Recarrega e aplica configuração salva (se houver)
         loadedFloatingPos = loadConfig()
         createGui()
         createOrUpdateFOVGui()
     end
 end)
 
--- Script feito por Kipressao11 (NOTIF) - renomeei a GUI para evitar conflito com screenGui
--- Coloque este script em StarterGui (como LocalScript) — mantive aqui só para compatibilidade
 local notifGui = Instance.new("ScreenGui")
 notifGui.Name = "Kipressao11_Notification"
 notifGui.ResetOnSpawn = false
@@ -722,7 +733,7 @@ notifGui.Parent = game.Players.LocalPlayer:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
 frame.Size = UDim2.new(0, 300, 0, 50)
-frame.Position = UDim2.new(0, 10, 1, -60) -- canto inferior esquerdo
+frame.Position = UDim2.new(0, 10, 1, -60)
 frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 frame.BackgroundTransparency = 0.2
 frame.BorderSizePixel = 0
@@ -748,7 +759,7 @@ for i = 1, 10 do
     task.wait(0.05)
 end
 
-wait(5) -- tempo que fica visível
+wait(5)
 
 for i = 1, 10 do
     frame.BackgroundTransparency = i * 0.1
