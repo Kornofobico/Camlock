@@ -6,9 +6,10 @@
     - Seletor de Parte Alvo (Head/HumanoidRootPart/Upper/LowerTorso)
     - Whitelist de Times (ilimitado)
     - Stick no alvo atual até ficar inválido (morto/fora de visão/fora do range)
-    - Wallcheck (raycast)
+    - Wallcheck (raycast) — sempre contra a posição real do alvo (opção A)
     - Rótulo "INIMIGO" no topo central da tela
     - AUTO FIRE (dispara automaticamente quando tem alvo)
+    - Offset de mira: suporte a Screen-space (pixels) e World-space (studs)
     - Salvamento/carregamento das configurações em CamlockConfig.json (se o executor suportar writefile/readfile)
 --]]
 
@@ -29,20 +30,16 @@ local autoFireEnabled = false
 local currentTarget -- BasePart (da parte alvo)
 local maxDistance = 500
 local lerpSpeed = 0.15
-local fov = 100 -- FOV adicionado (interpreto como raio em pixels)
+local fov = 100 -- FOV em pixels
 
 local selectedPart = "Head"
 local possibleParts = {"Head", "HumanoidRootPart", "UpperTorso", "LowerTorso"}
 
 local whitelistedTeams: {[string]: boolean} = {}
-local activeESP = {}
-local espUpdater -- connection/timer
 local enemyLabel -- topo da tela
 local screenGui -- raiz da GUI
 local mainFrame -- painel principal
 local openPanelButton -- botão flutuante para reabrir
-local lastESPUpdate = 0
-local ESP_UPDATE_INTERVAL = 0.35
 local lastAutoFireTime = 0
 local autoFireDelay = 0.1 -- Delay entre disparos (segundos)
 
@@ -50,8 +47,11 @@ local autoFireDelay = 0.1 -- Delay entre disparos (segundos)
 local toggleAimButton -- botão dentro do painel
 local floatingToggleButton -- botão flutuante externo
 
--- Offset de mira: adiciona ajuste de posição X/Y/Z ao alvo (em studs)
-local aimOffset = Vector3.new(0, 0, 0)
+-- Offsets: modo e valores
+-- offsetMode = "Screen" or "World"
+local offsetMode = "Screen"
+local screenOffset = Vector2.new(0, 0) -- em pixels (X para direita, Y para baixo)
+local aimOffset = Vector3.new(0, 0, 0) -- em studs, usado no modo World
 
 -- Config file
 local configPath = "CamlockConfig.json"
@@ -89,6 +89,9 @@ local function saveConfig()
             Y = floatingToggleButton.Position.Y.Scale,
             YOff = floatingToggleButton.Position.Y.Offset
         }) or nil,
+        -- offsets
+        offsetMode = offsetMode,
+        screenOffset = { x = screenOffset.X, y = screenOffset.Y },
         aimOffset = { x = aimOffset.X, y = aimOffset.Y, z = aimOffset.Z }
     }
     local ok, err = pcall(function()
@@ -96,7 +99,6 @@ local function saveConfig()
     end)
     if not ok then
         -- falhar silenciosamente se executor não permitir
-        -- print("Failed to save Camlock config:", err)
     end
 end
 
@@ -121,6 +123,14 @@ local function loadConfig()
         whitelistedTeams = data.whitelistedTeams
     end
 
+    if type(data.offsetMode) == "string" then
+        offsetMode = data.offsetMode
+    end
+    if type(data.screenOffset) == "table" then
+        local sx = tonumber(data.screenOffset.x) or 0
+        local sy = tonumber(data.screenOffset.y) or 0
+        screenOffset = Vector2.new(sx, sy)
+    end
     if type(data.aimOffset) == "table" then
         local ax = tonumber(data.aimOffset.x) or 0
         local ay = tonumber(data.aimOffset.y) or 0
@@ -128,10 +138,11 @@ local function loadConfig()
         aimOffset = Vector3.new(ax, ay, az)
     end
 
+    -- floatingPosition será lido posteriormente na criação do botão
     return data.floatingPosition
 end
 
---// FOV Circle (GUI-based visual, substitui Drawing)
+--// FOV Circle (GUI-based visual)
 local fovGuiFrame
 local function createOrUpdateFOVGui()
     if not screenGui or not screenGui.Parent then return end
@@ -161,13 +172,16 @@ local function createOrUpdateFOVGui()
         stroke.Parent = fovGuiFrame
     else
         fovGuiFrame.Size = UDim2.new(0, size, 0, size)
+    end
+
+    -- Para o modo Screen, posiciona o círculo ao redor da crosshair ajustada
+    if offsetMode == "Screen" then
+        -- calcula posição em escala/offset para o ScreenGui
+        local vx, vy = Camera.ViewportSize.X/2 + screenOffset.X, Camera.ViewportSize.Y/2 + screenOffset.Y
+        fovGuiFrame.Position = UDim2.new(0, vx, 0, vy)
+        fovGuiFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    else
         fovGuiFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
-        local stroke = fovGuiFrame:FindFirstChild("FOVStroke")
-        if stroke and stroke:IsA("UIStroke") then
-            stroke.Color = Color3.fromRGB(0, 255, 0)
-            stroke.Transparency = 0.4
-            stroke.Thickness = 2
-        end
     end
 
     fovGuiFrame.Visible = aimlockEnabled
@@ -178,21 +192,62 @@ RunService.RenderStepped:Connect(function()
         local radius = math.clamp(tonumber(fov) or 100, 1, 2000)
         local size = radius * 2
         fovGuiFrame.Size = UDim2.new(0, size, 0, size)
-        fovGuiFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+        if offsetMode == "Screen" then
+            local vx, vy = Camera.ViewportSize.X/2 + screenOffset.X, Camera.ViewportSize.Y/2 + screenOffset.Y
+            fovGuiFrame.Position = UDim2.new(0, vx, 0, vy)
+        else
+            fovGuiFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+        end
         fovGuiFrame.Visible = aimlockEnabled
     end
 end)
 
---// Util
+--// Helpers de mira
+local function getScreenPointFor(part)
+    -- retorna (Vector3 screenPoint, boolean onScreen)
+    if not part then return Vector3.new(0,0,0), false end
+    local baseScreenPoint, onScreen = Camera:WorldToViewportPoint(part.Position)
+    if not onScreen then return baseScreenPoint, false end
+
+    if offsetMode == "World" then
+        local adj = Camera:WorldToViewportPoint(part.Position + aimOffset)
+        return adj, true
+    else -- Screen mode
+        local adj = Vector3.new(baseScreenPoint.X + screenOffset.X, baseScreenPoint.Y + screenOffset.Y, baseScreenPoint.Z)
+        return adj, true
+    end
+end
+
+local function getAimPointWorld(part)
+    -- retorna o ponto world que o camlock deve mirar
+    if not part then return nil end
+    if offsetMode == "World" then
+        return part.Position + aimOffset
+    else
+        -- Screen mode: projetar para tela + ajustar + reconstituir ponto no mundo preservando depth
+        local baseScreenPoint, onScreen = Camera:WorldToViewportPoint(part.Position)
+        if not onScreen then
+            -- se não estiver na visão, ainda podemos usar a posição real
+            return part.Position
+        end
+        local adjX = baseScreenPoint.X + screenOffset.X
+        local adjY = baseScreenPoint.Y + screenOffset.Y
+        local depth = baseScreenPoint.Z
+        local ray = Camera:ViewportPointToRay(adjX, adjY)
+        local worldPoint = ray.Origin + ray.Direction * depth
+        return worldPoint
+    end
+end
+
+--// Util (visibilidade/wallcheck)
 local function onScreenAndVisible(part: BasePart)
     if not part then return false end
-    local targetPos = part.Position + aimOffset
-
-    local _, onScreen = Camera:WorldToViewportPoint(targetPos)
+    local screenPoint, onScreen = getScreenPointFor(part)
     if not onScreen then return false end
 
+    -- Wallcheck: por segurança, sempre checamos contra a posição real do personagem (opção A)
     local origin = Camera.CFrame.Position
-    local direction = (targetPos - origin)
+    local direction = (part.Position - origin)
     local rayParams = RaycastParams.new()
     rayParams.FilterDescendantsInstances = {LocalPlayer.Character}
     rayParams.FilterType = Enum.RaycastFilterType.Blacklist
@@ -205,8 +260,10 @@ local function isTargetValid(targetPart: BasePart)
     local char = targetPart.Parent
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return false end
-    local targetPos = targetPart.Position + aimOffset
-    if (targetPos - Camera.CFrame.Position).Magnitude > maxDistance then return false end
+
+    -- Distância (uso distância real em studs para evitar selecionar alvos muito longe)
+    if (targetPart.Position - Camera.CFrame.Position).Magnitude > maxDistance then return false end
+
     if not onScreenAndVisible(targetPart) then return false end
     return true
 end
@@ -216,20 +273,24 @@ local function getTeamName(player: Player)
 end
 
 local function isInFOV(targetPart: BasePart)
-    local targetPos = targetPart.Position + aimOffset
-    local screenPoint, onScreen = Camera:WorldToViewportPoint(targetPos)
+    local screenPoint, onScreen = getScreenPointFor(targetPart)
     if not onScreen then return false end
 
     local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    if offsetMode == "Screen" then
+        center = center + screenOffset
+    end
     local point = Vector2.new(screenPoint.X, screenPoint.Y)
     local distance = (point - center).Magnitude
-
     return distance <= fov
 end
 
 local function getNearestEnemyPart()
-    local closest: BasePart? = nil
+    local closest = nil
     local shortest = math.huge
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    if offsetMode == "Screen" then center = center + screenOffset end
+
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer and p.Character then
             local tname = getTeamName(p)
@@ -237,10 +298,17 @@ local function getNearestEnemyPart()
                 local hum = p.Character:FindFirstChildOfClass("Humanoid")
                 local part = p.Character:FindFirstChild(selectedPart)
                 if hum and hum.Health > 0 and part and part:IsA("BasePart") then
-                    local dist = (part.Position + aimOffset - Camera.CFrame.Position).Magnitude
-                    if dist < maxDistance and onScreenAndVisible(part) and dist < shortest and isInFOV(part) then
-                        shortest = dist
-                        closest = part
+                    local screenPoint, onScreen = getScreenPointFor(part)
+                    if onScreen then
+                        local pt = Vector2.new(screenPoint.X, screenPoint.Y)
+                        local dist = (pt - center).Magnitude
+                        if dist < shortest and dist <= fov then
+                            -- adicional: garantir checagem de visibilidade real
+                            if onScreenAndVisible(part) then
+                                shortest = dist
+                                closest = part
+                            end
+                        end
                     end
                 end
             end
@@ -257,7 +325,6 @@ local function performAutoFire()
     local currentTime = tick()
     if currentTime - lastAutoFireTime >= autoFireDelay then
         lastAutoFireTime = currentTime
-
         pcall(function()
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.ButtonR2, false, nil)
             task.wait(0.05)
@@ -337,7 +404,6 @@ local function enableDrag(handle: Instance, dragTarget: Instance)
     end)
 end
 
--- Função central para sincronizar ambos os botões de Aimlock
 local function setAimlockState(enabled)
     aimlockEnabled = enabled
     currentTarget = nil
@@ -346,19 +412,17 @@ local function setAimlockState(enabled)
         toggleAimButton.Text = "Aimlock: " .. (aimlockEnabled and "ON" or "OFF")
         toggleAimButton.BackgroundColor3 = aimlockEnabled and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(60, 60, 60)
     end
-
     if floatingToggleButton and floatingToggleButton.Parent then
         floatingToggleButton.Text = "Aimlock: " .. (aimlockEnabled and "ON" or "OFF")
         floatingToggleButton.BackgroundColor3 = aimlockEnabled and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(50, 50, 50)
     end
-
     if fovGuiFrame and fovGuiFrame.Parent then
         fovGuiFrame.Visible = aimlockEnabled
     end
-
     pcall(saveConfig)
 end
 
+-- Carregar configuração salva (se possível) antes de criar a GUI
 local loadedFloatingPos = loadConfig()
 
 --// GUI Principal
@@ -393,8 +457,8 @@ local function createGui()
     Instance.new("UICorner", openPanelButton).CornerRadius = UDim.new(0, 6)
 
     mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 290, 0, 500)
-    mainFrame.Position = UDim2.new(0.06, 0, 0.2, 0)
+    mainFrame.Size = UDim2.new(0, 320, 0, 560)
+    mainFrame.Position = UDim2.new(0.06, 0, 0.15, 0)
     mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
     mainFrame.BorderSizePixel = 0
     mainFrame.Visible = true
@@ -414,9 +478,9 @@ local function createGui()
     local title = Instance.new("TextLabel")
     title.BackgroundTransparency = 1
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Size = UDim2.new(1, -70, 1, 0)
+    title.Size = UDim2.new(1, -100, 1, 0)
     title.Position = UDim2.new(0, 12, 0, 0)
-    title.Text = "AIMLOCK V5"
+    title.Text = "AIMLOCK V6"
     title.TextColor3 = Color3.fromRGB(230,230,230)
     title.Font = Enum.Font.GothamBold
     title.TextSize = 16
@@ -452,13 +516,14 @@ local function createGui()
     local padding = Instance.new("UIPadding", content)
     padding.PaddingTop = UDim.new(0, 6)
     padding.PaddingBottom = UDim.new(0, 8)
-    padding.PaddingLeft = UDim.new(0, 4)
-    padding.PaddingRight = UDim.new(0, 4)
+    padding.PaddingLeft = UDim.new(0, 8)
+    padding.PaddingRight = UDim.new(0, 8)
 
     local list = Instance.new("UIListLayout", content)
     list.Padding = UDim.new(0, 10)
     list.SortOrder = Enum.SortOrder.LayoutOrder
 
+    -- CONTROLE
     makeSection(content, "CONTROLE")
     local toggleAim = makeButton(content, "Aimlock: OFF")
     toggleAimButton = toggleAim
@@ -466,6 +531,7 @@ local function createGui()
         setAimlockState(not aimlockEnabled)
     end)
 
+    -- AUTO FIRE
     makeSection(content, "AUTO FIRE")
     local toggleAutoFire = makeButton(content, "Auto Fire: OFF")
     toggleAutoFire.MouseButton1Click:Connect(function()
@@ -477,6 +543,7 @@ local function createGui()
     toggleAutoFire.Text = "Auto Fire: " .. (autoFireEnabled and "ON" or "OFF")
     toggleAutoFire.BackgroundColor3 = autoFireEnabled and Color3.fromRGB(170, 0, 0) or Color3.fromRGB(60, 60, 60)
 
+    -- PARÂMETROS
     makeSection(content, "PARÂMETROS")
     local distanceBox = makeInput(content, "Distância (studs)", tostring(maxDistance))
     distanceBox.FocusLost:Connect(function()
@@ -502,23 +569,23 @@ local function createGui()
         end
     end)
 
+    -- FOV
     makeSection(content, "FOV")
-    local fovBox = makeInput(content, "FOV (1-500)", tostring(fov))
+    local fovBox = makeInput(content, "FOV (pixels)", tostring(fov))
     fovBox.FocusLost:Connect(function()
         local num = tonumber(fovBox.Text)
-        if num and num >= 1 and num <= 500 then
+        if num and num >= 1 and num <= 2000 then
             fov = num
             fovBox.Text = tostring(num)
             createOrUpdateFOVGui()
-            if fovGuiFrame then
-                fovGuiFrame.Visible = aimlockEnabled
-            end
+            if fovGuiFrame then fovGuiFrame.Visible = aimlockEnabled end
             pcall(saveConfig)
         else
             fovBox.Text = tostring(fov)
         end
     end)
 
+    -- PARTE ALVO
     makeSection(content, "PARTE ALVO")
     local partList = Instance.new("ScrollingFrame")
     partList.Size = UDim2.new(1, 0, 0, 120)
@@ -558,6 +625,7 @@ local function createGui()
     end
     refreshPartButtons()
 
+    -- WHITELIST
     makeSection(content, "WHITELIST DE TIMES")
     local teamList = Instance.new("ScrollingFrame")
     teamList.Size = UDim2.new(1, 0, 0, 150)
@@ -591,47 +659,93 @@ local function createGui()
     Teams.ChildAdded:Connect(function() addTeamButtons() end)
     Teams.ChildRemoved:Connect(function() addTeamButtons() end)
 
+    -- OFFSET
     makeSection(content, "OFFSET")
-    local offsetContainer = Instance.new("Frame")
-    offsetContainer.Size = UDim2.new(1, 0, 0, 110)
-    offsetContainer.BackgroundTransparency = 1
-    offsetContainer.Parent = content
+    local modeBtn = makeButton(content, "Offset Mode: " .. string.upper(offsetMode))
+    -- Screen inputs
+    local screenXBox = makeInput(content, "Screen Offset X (px)", tostring(screenOffset.X))
+    local screenYBox = makeInput(content, "Screen Offset Y (px)", tostring(screenOffset.Y))
+    -- World inputs
+    local worldXBox = makeInput(content, "World Offset X (studs)", tostring(aimOffset.X))
+    local worldYBox = makeInput(content, "World Offset Y (studs)", tostring(aimOffset.Y))
+    local worldZBox = makeInput(content, "World Offset Z (studs)", tostring(aimOffset.Z))
 
-    local offsetXBox = makeInput(offsetContainer, "Offset X (studs)", tostring(aimOffset.X))
-    local offsetYBox = makeInput(offsetContainer, "Offset Y (studs)", tostring(aimOffset.Y))
-    local offsetZBox = makeInput(offsetContainer, "Offset Z (studs)", tostring(aimOffset.Z))
+    local resetBtn = makeButton(content, "Reset Offsets")
 
-    offsetXBox.FocusLost:Connect(function()
-        local nx = tonumber(offsetXBox.Text)
+    modeBtn.MouseButton1Click:Connect(function()
+        if offsetMode == "Screen" then offsetMode = "World" else offsetMode = "Screen" end
+        modeBtn.Text = "Offset Mode: " .. string.upper(offsetMode)
+        pcall(saveConfig)
+        createOrUpdateFOVGui()
+    end)
+
+    screenXBox.FocusLost:Connect(function()
+        local nx = tonumber(screenXBox.Text)
+        if nx then
+            screenOffset = Vector2.new(nx, screenOffset.Y)
+            screenXBox.Text = tostring(nx)
+            pcall(saveConfig)
+            createOrUpdateFOVGui()
+        else
+            screenXBox.Text = tostring(screenOffset.X)
+        end
+    end)
+    screenYBox.FocusLost:Connect(function()
+        local ny = tonumber(screenYBox.Text)
+        if ny then
+            screenOffset = Vector2.new(screenOffset.X, ny)
+            screenYBox.Text = tostring(ny)
+            pcall(saveConfig)
+            createOrUpdateFOVGui()
+        else
+            screenYBox.Text = tostring(screenOffset.Y)
+        end
+    end)
+
+    worldXBox.FocusLost:Connect(function()
+        local nx = tonumber(worldXBox.Text)
         if nx then
             aimOffset = Vector3.new(nx, aimOffset.Y, aimOffset.Z)
-            offsetXBox.Text = tostring(nx)
+            worldXBox.Text = tostring(nx)
             pcall(saveConfig)
         else
-            offsetXBox.Text = tostring(aimOffset.X)
+            worldXBox.Text = tostring(aimOffset.X)
         end
     end)
-    offsetYBox.FocusLost:Connect(function()
-        local ny = tonumber(offsetYBox.Text)
+    worldYBox.FocusLost:Connect(function()
+        local ny = tonumber(worldYBox.Text)
         if ny then
             aimOffset = Vector3.new(aimOffset.X, ny, aimOffset.Z)
-            offsetYBox.Text = tostring(ny)
+            worldYBox.Text = tostring(ny)
             pcall(saveConfig)
         else
-            offsetYBox.Text = tostring(aimOffset.Y)
+            worldYBox.Text = tostring(aimOffset.Y)
         end
     end)
-    offsetZBox.FocusLost:Connect(function()
-        local nz = tonumber(offsetZBox.Text)
+    worldZBox.FocusLost:Connect(function()
+        local nz = tonumber(worldZBox.Text)
         if nz then
             aimOffset = Vector3.new(aimOffset.X, aimOffset.Y, nz)
-            offsetZBox.Text = tostring(nz)
+            worldZBox.Text = tostring(nz)
             pcall(saveConfig)
         else
-            offsetZBox.Text = tostring(aimOffset.Z)
+            worldZBox.Text = tostring(aimOffset.Z)
         end
     end)
 
+    resetBtn.MouseButton1Click:Connect(function()
+        screenOffset = Vector2.new(0,0)
+        aimOffset = Vector3.new(0,0,0)
+        screenXBox.Text = tostring(0)
+        screenYBox.Text = tostring(0)
+        worldXBox.Text = tostring(0)
+        worldYBox.Text = tostring(0)
+        worldZBox.Text = tostring(0)
+        pcall(saveConfig)
+        createOrUpdateFOVGui()
+    end)
+
+    -- BOTÃO FLUTUANTE
     local floatingToggle = Instance.new("TextButton")
     floatingToggle.Name = "FloatingAimToggle"
     floatingToggle.Size = UDim2.new(0, 120, 0, 40)
@@ -696,9 +810,11 @@ local rsConn = RunService.RenderStepped:Connect(function(dt)
         end
         if currentTarget then
             local pos = Camera.CFrame.Position
-            local targetPos = currentTarget.Position + aimOffset
-            local desired = CFrame.new(pos, targetPos)
-            Camera.CFrame = Camera.CFrame:Lerp(desired, lerpSpeed)
+            local targetPos = getAimPointWorld(currentTarget)
+            if targetPos then
+                local desired = CFrame.new(pos, targetPos)
+                Camera.CFrame = Camera.CFrame:Lerp(desired, lerpSpeed)
+            end
             performAutoFire()
         end
 
@@ -710,6 +826,7 @@ local rsConn = RunService.RenderStepped:Connect(function(dt)
     end
 end)
 
+--// Inicialização GUI e FOV
 createGui()
 createOrUpdateFOVGui()
 
@@ -726,6 +843,7 @@ LocalPlayer.CharacterAdded:Connect(function()
     end
 end)
 
+-- Notificação original
 local notifGui = Instance.new("ScreenGui")
 notifGui.Name = "Kipressao11_Notification"
 notifGui.ResetOnSpawn = false
